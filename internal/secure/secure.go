@@ -168,30 +168,49 @@ func (s *Server) Handshake(ctx context.Context, conn net.Conn) (_ *tls.Conn, err
 	if p := tc.ConnectionState().NegotiatedProtocol; p != alpn {
 		return nil, fmt.Errorf("peer negotiated protocol %q, want %q", p, alpn)
 	}
-	ekm, err := exporter(tc)
+	ekm, err := Exporter(tc.ConnectionState())
 	if err != nil {
 		return nil, err
 	}
-
-	msgA := make([]byte, msgALen)
-	if _, err := io.ReadFull(tc, msgA); err != nil {
+	if err := s.pake(tc, ekm); err != nil {
 		return nil, err
+	}
+	return tc, nil
+}
+
+// HandshakeStream runs the sender's code check on a stream that is already
+// encrypted by TLS 1.3 (a QUIC stream, say), whose exporter is ekm (see
+// Exporter). The one-guess rule is shared with Handshake. The caller
+// handles deadlines and closing.
+func (s *Server) HandshakeStream(rw io.ReadWriter, ekm []byte) error {
+	return s.pake(rw, ekm)
+}
+
+// TLSConfig returns the sender's TLS configuration, for transports such as
+// QUIC that run TLS themselves.
+func (s *Server) TLSConfig() *tls.Config { return s.tlsConf.Clone() }
+
+// pake is the sender side of the code check over an encrypted stream.
+func (s *Server) pake(rw io.ReadWriter, ekm []byte) error {
+	msgA := make([]byte, msgALen)
+	if _, err := io.ReadFull(rw, msgA); err != nil {
+		return err
 	}
 	msgB, key, err := cpace.Exchange(s.password, contextInfo(ekm), msgA)
 	if err != nil {
-		return nil, err
+		return err
 	}
-	if _, err := tc.Write(msgB); err != nil {
-		return nil, err
+	if _, err := rw.Write(msgB); err != nil {
+		return err
 	}
 	recvKey, sendKey, err := confirmKeys(key)
 	if err != nil {
-		return nil, err
+		return err
 	}
 
 	peerMAC := make([]byte, macLen)
-	if _, err := io.ReadFull(tc, peerMAC); err != nil {
-		return nil, err
+	if _, err := io.ReadFull(rw, peerMAC); err != nil {
+		return err
 	}
 
 	// Check the proof under the lock so that at most one wrong guess is
@@ -200,22 +219,22 @@ func (s *Server) Handshake(ctx context.Context, conn net.Conn) (_ *tls.Conn, err
 	switch {
 	case s.burned || s.used:
 		s.mu.Unlock()
-		tc.Write([]byte{statusRefused})
-		return nil, ErrRefused
+		rw.Write([]byte{statusRefused})
+		return ErrRefused
 	case !hmac.Equal(peerMAC, confirmMAC(recvKey, idReceiver, msgA, msgB)):
 		s.burned = true
 		s.mu.Unlock()
-		tc.Write([]byte{statusWrongCode})
-		return nil, ErrWrongCode
+		rw.Write([]byte{statusWrongCode})
+		return ErrWrongCode
 	}
 	s.used = true
 	s.mu.Unlock()
 
 	reply := append([]byte{statusOK}, confirmMAC(sendKey, idSender, msgA, msgB)...)
-	if _, err := tc.Write(reply); err != nil {
-		return nil, fmt.Errorf("%w: %v", ErrLostAfterProof, err)
+	if _, err := rw.Write(reply); err != nil {
+		return fmt.Errorf("%w: %v", ErrLostAfterProof, err)
 	}
-	return tc, nil
+	return nil
 }
 
 // SentProofError wraps errors that happened after the receiver sent its
@@ -253,70 +272,93 @@ func Client(ctx context.Context, conn net.Conn, password string) (_ *tls.Conn, e
 		return nil, &VersionError{Ours: ProtocolVersion, Peer: peerVer}
 	}
 
-	tc := tls.Client(conn, &tls.Config{
-		MinVersion: tls.VersionTLS13,
-		// Authentication comes from the PAKE bound to the TLS exporter,
-		// not from certificates: the sender's certificate is ephemeral.
-		InsecureSkipVerify: true,
-		NextProtos:         []string{alpn},
-		ServerName:         "toss",
-	})
+	tc := tls.Client(conn, ClientTLSConfig())
 	if err := tc.HandshakeContext(ctx); err != nil {
 		return nil, fmt.Errorf("tls: %w", err)
 	}
 	if p := tc.ConnectionState().NegotiatedProtocol; p != alpn {
 		return nil, fmt.Errorf("peer negotiated protocol %q, want %q", p, alpn)
 	}
-	ekm, err := exporter(tc)
+	ekm, err := Exporter(tc.ConnectionState())
 	if err != nil {
 		return nil, err
 	}
+	if err := clientPAKE(tc, ekm, password); err != nil {
+		return nil, err
+	}
+	return tc, nil
+}
 
+// ClientStream runs the receiver's code check on a stream that is already
+// encrypted by TLS 1.3 (a QUIC stream, say), whose exporter is ekm. Errors
+// follow the same rules as Client's.
+func ClientStream(rw io.ReadWriter, ekm []byte, password string) error {
+	return clientPAKE(rw, ekm, password)
+}
+
+// ClientTLSConfig is the receiver's TLS configuration. The sender's
+// certificate is not checked: authentication comes from the code check,
+// which is bound to the TLS session through its exporter.
+func ClientTLSConfig() *tls.Config {
+	return &tls.Config{
+		MinVersion:         tls.VersionTLS13,
+		InsecureSkipVerify: true,
+		NextProtos:         []string{alpn},
+		ServerName:         "toss",
+	}
+}
+
+// ALPN is the application protocol both sides offer in TLS; it changes
+// with the protocol version, so mismatched versions fail the handshake.
+const ALPN = alpn
+
+// clientPAKE is the receiver side of the code check over an encrypted stream.
+func clientPAKE(rw io.ReadWriter, ekm []byte, password string) error {
 	msgA, state, err := cpace.Start(password, contextInfo(ekm))
 	if err != nil {
-		return nil, err
+		return err
 	}
-	if _, err := tc.Write(msgA); err != nil {
-		return nil, err
+	if _, err := rw.Write(msgA); err != nil {
+		return err
 	}
 	msgB := make([]byte, msgBLen)
-	if _, err := io.ReadFull(tc, msgB); err != nil {
-		return nil, err
+	if _, err := io.ReadFull(rw, msgB); err != nil {
+		return err
 	}
 	key, err := state.Finish(msgB)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	recvKey, sendKey, err := confirmKeys(key)
 	if err != nil {
-		return nil, err
+		return err
 	}
 
 	// From here on the attempt counts against the code.
-	if _, err := tc.Write(confirmMAC(recvKey, idReceiver, msgA, msgB)); err != nil {
-		return nil, &SentProofError{ErrConfirmLost}
+	if _, err := rw.Write(confirmMAC(recvKey, idReceiver, msgA, msgB)); err != nil {
+		return &SentProofError{ErrConfirmLost}
 	}
 	var status [1]byte
-	if _, err := io.ReadFull(tc, status[:]); err != nil {
-		return nil, &SentProofError{ErrConfirmLost}
+	if _, err := io.ReadFull(rw, status[:]); err != nil {
+		return &SentProofError{ErrConfirmLost}
 	}
 	switch status[0] {
 	case statusOK:
 	case statusWrongCode:
-		return nil, &SentProofError{ErrWrongCode}
+		return &SentProofError{ErrWrongCode}
 	case statusRefused:
-		return nil, &SentProofError{ErrRefused}
+		return &SentProofError{ErrRefused}
 	default:
-		return nil, &SentProofError{fmt.Errorf("unexpected handshake status %d", status[0])}
+		return &SentProofError{fmt.Errorf("unexpected handshake status %d", status[0])}
 	}
 	peerMAC := make([]byte, macLen)
-	if _, err := io.ReadFull(tc, peerMAC); err != nil {
-		return nil, &SentProofError{ErrConfirmLost}
+	if _, err := io.ReadFull(rw, peerMAC); err != nil {
+		return &SentProofError{ErrConfirmLost}
 	}
 	if !hmac.Equal(peerMAC, confirmMAC(sendKey, idSender, msgA, msgB)) {
-		return nil, &SentProofError{ErrPeerFailedConfirm}
+		return &SentProofError{ErrPeerFailedConfirm}
 	}
-	return tc, nil
+	return nil
 }
 
 func preamble() []byte { return append([]byte(magic), ProtocolVersion) }
@@ -335,10 +377,13 @@ func readPreamble(r io.Reader) (byte, error) {
 	return b[len(magic)], nil
 }
 
-func exporter(tc *tls.Conn) ([]byte, error) {
-	cs := tc.ConnectionState()
+// Exporter returns the keying material the code check is bound to.
+func Exporter(cs tls.ConnectionState) ([]byte, error) {
 	if cs.Version != tls.VersionTLS13 {
 		return nil, errors.New("tls: not TLS 1.3")
+	}
+	if cs.NegotiatedProtocol != alpn {
+		return nil, fmt.Errorf("peer negotiated protocol %q, want %q", cs.NegotiatedProtocol, alpn)
 	}
 	return cs.ExportKeyingMaterial(exporterName, nil, 32)
 }

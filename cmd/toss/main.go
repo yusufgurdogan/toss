@@ -16,12 +16,16 @@ import (
 	"path/filepath"
 	"runtime/debug"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
 	"github.com/yusufgurdogan/toss/internal/code"
 	"github.com/yusufgurdogan/toss/internal/connect"
 	"github.com/yusufgurdogan/toss/internal/lan"
+	"github.com/yusufgurdogan/toss/internal/qconn"
+	"github.com/yusufgurdogan/toss/internal/rendezvous"
 	"github.com/yusufgurdogan/toss/internal/secure"
 	"github.com/yusufgurdogan/toss/internal/xfer"
 )
@@ -44,13 +48,15 @@ Send options:
   --code CODE   use this code instead of a random one
   --port N      listen on TCP port N (default: 47924, or any free port if
                 that's taken)
-  --no-lan      don't answer local network searches; the code then includes
-                this computer's address
+  --no-lan      don't answer searches on the local network
+  --no-dht      don't meet over the internet (BitTorrent DHT); the receiver
+                must be on the same network or use CODE@ADDRESS:PORT
 
 Receive options:
   --out DIR     save into DIR (default: the current folder)
   --yes, -y     accept without asking
   --overwrite   replace existing files that are different
+  --no-dht      look for the sender on this network only
 
 When receiving, the code can also come from the TOSS_CODE environment
 variable or be typed at the prompt, which keeps it out of the process list on
@@ -66,6 +72,9 @@ wrong code, the sender stops and you need a new one.
 var stderr io.Writer = os.Stderr
 
 func main() {
+	// quic-go warns on stderr when the OS caps UDP buffer sizes; that is
+	// advice for server operators, not something a toss user can act on.
+	os.Setenv("QUIC_GO_DISABLE_RECEIVE_BUFFER_WARNING", "true")
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	// A second Ctrl-C kills the process immediately.
 	context.AfterFunc(ctx, stop)
@@ -159,6 +168,7 @@ type sendFlags struct {
 	code  *string
 	port  *int
 	noLAN *bool
+	noDHT *bool
 }
 
 func newSendFlags() *sendFlags {
@@ -168,6 +178,7 @@ func newSendFlags() *sendFlags {
 		code:  fs.String("code", "", ""),
 		port:  fs.Int("port", 0, ""),
 		noLAN: fs.Bool("no-lan", false, ""),
+		noDHT: fs.Bool("no-dht", false, ""),
 	}
 }
 
@@ -236,38 +247,68 @@ func cmdSend(ctx context.Context, args []string) error {
 		return err
 	}
 
+	// Meet receivers on other networks through the DHT.
+	var rv *rendezvous.Sender
+	if !*flags.noDHT {
+		var published atomic.Bool
+		var warnOnce sync.Once
+		rv, err = rendezvous.StartSender(ctx, c.MeetingID(), srv.TLSConfig(), qconn.Config(), rendezvous.Options{
+			Bootstrap: dhtBootstrap(),
+			Event: func(e rendezvous.Event) {
+				debugEvent(e)
+				switch e.Kind {
+				case "published":
+					published.Store(true)
+				case "dht-error":
+					// One family failing (say, no IPv6) is normal; warn
+					// only if nothing got published for a while.
+					warnOnce.Do(func() {
+						time.AfterFunc(20*time.Second, func() {
+							if !published.Load() && ctx.Err() == nil {
+								fmt.Fprintln(stderr, "Note: can't reach the internet meeting point (BitTorrent DHT), so only")
+								fmt.Fprintln(stderr, "receivers on this network can find this computer.")
+							}
+						})
+					})
+				}
+			},
+		})
+		if err != nil {
+			fmt.Fprintf(stderr, "Note: internet connections unavailable (%v).\n", err)
+		} else {
+			defer rv.Close()
+		}
+	}
+
 	fmt.Fprintf(stderr, "Sending %s.\n\n", describe(len(src.Offer.Files), src.Total))
-	// One code to read out. An address is only mentioned when it's
-	// needed: as a hint when this computer is reachable from other
-	// networks, or as part of the code with --no-lan.
-	public, private := lan.Addrs()
-	portStr := fmt.Sprint(tcpPort)
-	if *flags.noLAN {
+	if *flags.noLAN && rv == nil {
+		// Neither search can find us: the address must be in the code.
 		addr := "ADDRESS"
+		public, private := lan.Addrs()
 		if a, ok := bestAddr(public, private); ok {
 			addr = a.String()
 		}
-		fmt.Fprintf(stderr, "On the other computer, run:\n\n    toss %s\n\n", c.WithAddr(net.JoinHostPort(addr, portStr)))
+		fmt.Fprintf(stderr, "On the other computer, run:\n\n    toss %s\n\n", c.WithAddr(net.JoinHostPort(addr, fmt.Sprint(tcpPort))))
 		if addr == "ADDRESS" {
 			fmt.Fprintln(stderr, "(ADDRESS is this computer's IP address.)")
 			fmt.Fprintln(stderr)
 		}
 	} else {
 		fmt.Fprintf(stderr, "On the other computer, run:\n\n    toss %s\n\n", c)
-		if a, ok := bestAddr(public, nil); ok {
-			fmt.Fprintf(stderr, "From another network, add this computer's address to the end of the code: @%s\n\n", net.JoinHostPort(a.String(), portStr))
-		}
 	}
 	fmt.Fprintln(stderr, "Waiting for the receiver... (Ctrl-C to cancel)")
 
 	warned := false
-	tc, err := connect.Serve(ctx, ln, srv, func(err error) {
+	tc, err := connect.Serve(ctx, ln, rv, srv, func(err error) {
 		var ve *secure.VersionError
 		if errors.As(err, &ve) && !warned {
 			warned = true
 			fmt.Fprintf(stderr, "A receiver connected but can't be served: %v\n", err)
 		}
 	})
+	if rv != nil {
+		rv.Stop() // stop announcing; a QUIC transfer keeps its socket
+	}
 	if responder != nil {
 		responder.Close()
 	}
@@ -327,6 +368,34 @@ func bestAddr(public, private []netip.Addr) (netip.Addr, bool) {
 	return netip.Addr{}, false
 }
 
+// debugOn turns on diagnostic output about finding the other side.
+var debugOn = os.Getenv("TOSS_DEBUG") != ""
+
+func debugEvent(e rendezvous.Event) {
+	if !debugOn {
+		return
+	}
+	switch {
+	case e.Err != nil:
+		fmt.Fprintf(stderr, "debug: %s: %v\n", e.Kind, e.Err)
+	case e.Addr.IsValid():
+		fmt.Fprintf(stderr, "debug: %s %v\n", e.Kind, e.Addr)
+	default:
+		fmt.Fprintf(stderr, "debug: %s\n", e.Kind)
+	}
+}
+
+// dhtBootstrap returns DHT nodes to join through instead of the public
+// bootstrap routers, from TOSS_DHT_BOOTSTRAP (comma-separated host:port),
+// for private DHT networks and tests. nil means the defaults.
+func dhtBootstrap() []string {
+	v := os.Getenv("TOSS_DHT_BOOTSTRAP")
+	if v == "" {
+		return nil
+	}
+	return strings.Split(v, ",")
+}
+
 // defaultTCPPort is where the sender listens unless it's taken (another
 // toss is sending) or --port says otherwise. A fixed default lets people
 // open it once in a firewall or forward it on a router.
@@ -352,6 +421,7 @@ func cmdReceive(ctx context.Context, args []string) error {
 	yes := fs.Bool("yes", false, "")
 	fs.BoolVar(yes, "y", false, "")
 	overwrite := fs.Bool("overwrite", false, "")
+	noDHT := fs.Bool("no-dht", false, "")
 	pos, err := parseArgs(fs, args)
 	if err != nil {
 		return err
@@ -403,12 +473,21 @@ func cmdReceive(ctx context.Context, args []string) error {
 	if c.Addr != "" {
 		fmt.Fprintf(stderr, "Connecting to the sender at %s...\n", c.Addr)
 	} else {
-		fmt.Fprintln(stderr, "Looking for the sender on this network...")
+		fmt.Fprintln(stderr, "Looking for the sender...")
 	}
 	dctx, cancel := context.WithTimeout(ctx, findTimeout)
 	// With an address in the code, connect only there: no need to
-	// announce the meeting ID on the local network.
-	tc, err := connect.Dial(dctx, c, connect.DialOptions{NoLAN: c.Addr != ""})
+	// announce the meeting ID anywhere.
+	tc, err := connect.Dial(dctx, c, connect.DialOptions{
+		NoLAN:      c.Addr != "",
+		NoDHT:      c.Addr != "" || *noDHT,
+		Rendezvous: rendezvous.Options{Bootstrap: dhtBootstrap(), Event: debugEvent},
+		Status: func(msg string) {
+			if debugOn {
+				fmt.Fprintln(stderr, "debug:", msg)
+			}
+		},
+	})
 	cancel()
 	if err != nil {
 		return explainDialError(err)
@@ -467,13 +546,22 @@ func explainDialError(err error) error {
 	case errors.As(err, &ve):
 		return err
 	case errors.As(err, &nf):
-		fmt.Fprintf(stderr, "%v.\n", nf)
-		if nf.Addr == "" {
-			fmt.Fprintln(stderr, "Check that toss send is running with this code and that both computers are on")
-			fmt.Fprintln(stderr, "the same network. From another network, add the sender's address to the code:")
-			fmt.Fprintln(stderr, "toss CODE@ADDRESS:PORT (toss send shows it when it has a public address).")
-		} else {
+		switch {
+		case nf.Addr != "":
+			fmt.Fprintf(stderr, "%v.\n", nf)
 			fmt.Fprintln(stderr, "Check that toss send is still running and that no firewall blocks the port.")
+		case nf.FoundOnline > 0:
+			fmt.Fprintln(stderr, "Found the sender, but couldn't open a direct connection between your two networks.")
+			fmt.Fprintln(stderr, "toss never sends files through anyone else's server, so it needs a direct path.")
+			fmt.Fprintln(stderr, "This happens when both networks block incoming connections, as some mobile")
+			fmt.Fprintln(stderr, "carriers and office networks do. Things that usually help:")
+			fmt.Fprintln(stderr, "  - put one computer on a different network (home Wi-Fi, or a phone hotspot)")
+			fmt.Fprintln(stderr, "  - on the sender's router, forward TCP port 47924 to the sender, then use")
+			fmt.Fprintln(stderr, "    toss CODE@ROUTER-PUBLIC-IP:47924")
+		default:
+			fmt.Fprintln(stderr, "Couldn't find the sender. Check that toss send is still running and that the")
+			fmt.Fprintln(stderr, "code is right. If neither computer can reach the internet, they need to be on")
+			fmt.Fprintln(stderr, "the same network.")
 		}
 		return errSilent
 	case errors.Is(err, context.Canceled):

@@ -228,6 +228,11 @@ Skipped on purpose:
 ## Milestones
 
 1. **Same network + direct address, with resume.** Done.
+1b. **Different networks, one code.** BitTorrent DHT rendezvous (in-repo
+   client, IPv4 + IPv6), UDP hole punching with an ordered, TTL-limited
+   first punch (see internal/rendezvous), QUIC (quic-go) on the same socket,
+   the same TLS+PAKE binding. Works across cone NATs; symmetric NATs still
+   fail (port mapping and birthday-style port guessing are next).
 2. Router port opening: UPnP IGD, NAT-PMP, PCP (written in-repo).
 3. **Router-to-router**: BitTorrent mainline DHT (minimal in-repo KRPC client;
    announce under H(meetingID); DHT responses' `ip` field gives our public

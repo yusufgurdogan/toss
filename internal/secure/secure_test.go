@@ -366,7 +366,7 @@ func TestLostAfterProof(t *testing.T) {
 	if err := tc.Handshake(); err != nil {
 		t.Fatal(err)
 	}
-	ekm, _ := exporter(tc)
+	ekm, _ := Exporter(tc.ConnectionState())
 	msgA, state, _ := cpaceStart(pw, ekm)
 	tc.Write(msgA)
 	msgB := make([]byte, msgBLen)

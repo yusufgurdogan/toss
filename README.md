@@ -89,19 +89,20 @@ On a shared computer, pass the code in the `TOSS_CODE` environment variable
 
 ## Where it works
 
-- **Same network** (home, office, two machines on one switch): the receiver
-  finds the sender automatically.
-- **The sender is reachable** (public IP, a forwarded port, a VPN): add the
-  sender's address to the end of the code, e.g.
-  `toss 7392-river-moon-sun@203.0.113.5:47924`. When the sender has a public
-  address, `toss send` shows it. For a VPN or a network that blocks the
-  automatic search, use the sender's VPN or LAN address the same way.
+Anywhere the two computers can reach the internet, with the same one code:
 
-Two computers on different networks, both behind NAT, can't connect yet. That
-is the next milestone: finding each other through the BitTorrent DHT and
-punching through NAT. toss will still never relay your data: when a direct
-connection is impossible it says so instead of sending your files through
-someone else's server.
+- **Same network:** found instantly on the local network.
+- **Different networks:** both sides meet through the BitTorrent DHT (the
+  same worldwide, ownerless network torrent clients use) and open a direct
+  connection through their routers with UDP hole punching, then transfer
+  over QUIC. This works behind typical home routers and on servers whose
+  incoming ports are closed.
+- **Some networks can't be connected directly yet,** mainly ones with
+  "symmetric" NAT: some office firewalls, cloud NAT gateways and mobile
+  carriers. toss never relays your data through anyone else's server; when
+  no direct path exists it says so and suggests what helps.
+- If you know the sender's address and port is open, you can also skip the
+  search: `toss 7392-river-moon-sun@203.0.113.5:47924`.
 
 ### Firewalls
 
@@ -155,7 +156,8 @@ anything, toss checks that the bytes on both sides match.
 - **What the network can see.** The two IP addresses, the timing, and roughly
   how much data moved. File names, sizes and contents are encrypted. On the
   local network, the receiver's search packets name the public part of the
-  code.
+  code. The DHT nodes both sides talk to see their public IP addresses and a
+  hash of the code's public part; nothing secret goes through the DHT.
 
 ## How it works
 

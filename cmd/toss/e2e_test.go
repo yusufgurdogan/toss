@@ -87,8 +87,9 @@ func (p *proc) wait(t *testing.T) (int, string) {
 func pair(t *testing.T, sendArgs []string, recvCode string, recvStdin string, recvArgs ...string) (sc int, sout string, rc int, rout string) {
 	t.Helper()
 	port := freePort(t)
-	// --no-lan: the tests must not join multicast groups on real networks.
-	s := start(t, "", append([]string{"send", "--no-lan", "--port", fmt.Sprint(port)}, sendArgs...)...)
+	// --no-lan, --no-dht: tests must not join multicast groups on real
+	// networks or talk to the real DHT. The receiver uses CODE@ADDRESS.
+	s := start(t, "", append([]string{"send", "--no-lan", "--no-dht", "--port", fmt.Sprint(port)}, sendArgs...)...)
 	time.Sleep(300 * time.Millisecond)
 	r := start(t, recvStdin, append([]string{fmt.Sprintf("%s@127.0.0.1:%d", recvCode, port)}, recvArgs...)...)
 	rc, rout = r.wait(t)
