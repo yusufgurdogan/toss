@@ -46,6 +46,9 @@ func Collect(paths []string) (*Source, error) {
 
 		// Follow a symlink given as an argument: the user named it.
 		real, err := filepath.EvalSymlinks(abs)
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil, fmt.Errorf("%s: no such file or folder", arg)
+		}
 		if err != nil {
 			return nil, err
 		}

@@ -151,3 +151,25 @@ func TestNotable(t *testing.T) {
 		t.Errorf("Summarize = %+v", top)
 	}
 }
+
+func TestWindowsDeviceNames(t *testing.T) {
+	// Checked on every OS so the rule is tested even without Windows CI.
+	for _, n := range []string{"NUL", "nul", "NUL.txt", "nul.tar.gz", "NUL .txt", "CON", "aux.log",
+		"COM1", "com9.txt", "LPT3", "COM¹", "LPT².dat", "CONIN$", "conout$.x", "CLOCK$", "COM0"} {
+		if !windowsDeviceName(n) {
+			t.Errorf("%q not recognized as a Windows device name", n)
+		}
+	}
+	for _, n := range []string{"NULL", "nul_", "CONSOLE.txt", "COM10", "COM", "LPT", "a.NUL", "AUXI", "photo.jpg", "COMA"} {
+		if windowsDeviceName(n) {
+			t.Errorf("%q wrongly treated as a Windows device name", n)
+		}
+	}
+	if runtime.GOOS == "windows" {
+		for _, p := range []string{"a/NUL.txt", "CON", "x/com1.log"} {
+			if ValidatePath(p) == nil {
+				t.Errorf("%q accepted on Windows", p)
+			}
+		}
+	}
+}

@@ -310,12 +310,32 @@ func ValidatePath(p string) error {
 			return errors.New("file name too long")
 		case runtime.GOOS == "windows" && strings.TrimRight(part, ". ") != part:
 			return errors.New("name ends with a dot or space, which Windows does not allow")
+		case runtime.GOOS == "windows" && windowsDeviceName(part):
+			return fmt.Errorf("%q is a reserved device name on Windows", part)
 		}
 	}
 	if !filepath.IsLocal(filepath.FromSlash(p)) {
 		return errors.New("path is not local (reserved name?)")
 	}
 	return nil
+}
+
+// windowsDeviceName reports names that Windows may open as a device instead
+// of a file: CON, PRN, AUX, NUL, COM1-9, LPT1-9 (also with superscript
+// digits), CONIN$, CONOUT$ and CLOCK$, in any case, with or without an
+// extension ("NUL.txt") and with trailing spaces before it ("NUL .txt").
+// filepath.IsLocal doesn't catch all of these on every Windows version.
+func windowsDeviceName(name string) bool {
+	stem, _, _ := strings.Cut(name, ".")
+	stem = strings.ToUpper(strings.TrimRight(stem, " "))
+	switch stem {
+	case "CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$", "CLOCK$":
+		return true
+	}
+	if r := []rune(stem); len(r) == 4 && (strings.HasPrefix(stem, "COM") || strings.HasPrefix(stem, "LPT")) {
+		return r[3] >= '0' && r[3] <= '9' || r[3] == '¹' || r[3] == '²' || r[3] == '³'
+	}
+	return false
 }
 
 // caseInsensitiveFS reports whether file names on this OS are usually case

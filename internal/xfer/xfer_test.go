@@ -472,7 +472,7 @@ func TestMaliciousOffers(t *testing.T) {
 		"x" + PartSuffix, strings.Repeat("a", 256), strings.Repeat("a/", 200) + "a",
 	}
 	if runtime.GOOS == "windows" {
-		bad = append(bad, "CON", "a/NUL.txt", "C:/x", "a:b", "a.", "a ")
+		bad = append(bad, "CON", "a/NUL.txt", "NUL .txt", "COM1.log", "C:/x", "a:b", "a.", "a ")
 	}
 	for _, p := range bad {
 		dst := t.TempDir()
