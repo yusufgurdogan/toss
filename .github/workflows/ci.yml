@@ -1,0 +1,97 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: '1.26.x'
+          check-latest: true
+      - name: Check formatting
+        if: runner.os == 'Linux'
+        run: test -z "$(gofmt -l .)"
+      - run: go vet ./...
+      - name: Test
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = Windows ]; then
+            go test ./...
+          else
+            go test -race ./...
+          fi
+
+  # Run the real installers against a locally served build.
+  install:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: '1.26.x'
+          check-latest: true
+      - name: install.sh
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          name="toss_$(go env GOOS)_$(go env GOARCH).tar.gz"
+          mkdir srv
+          CGO_ENABLED=0 go build -o toss ./cmd/toss
+          tar -czf "srv/$name" toss
+          (cd srv && shasum -a 256 "$name" > SHA256SUMS)
+          python3 -m http.server 8765 --bind 127.0.0.1 --directory srv &
+          sleep 2
+          TOSS_BASE_URL=http://127.0.0.1:8765 TOSS_INSTALL_DIR="$RUNNER_TEMP/bin" sh install.sh
+          "$RUNNER_TEMP/bin/toss" version
+          # A tampered download must be refused.
+          echo x >> "srv/$name"
+          if TOSS_BASE_URL=http://127.0.0.1:8765 TOSS_INSTALL_DIR="$RUNNER_TEMP/bin2" sh install.sh; then
+            echo "tampered archive was installed"; exit 1
+          fi
+      - name: install.ps1
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $env:CGO_ENABLED = '0'
+          go build -o toss.exe ./cmd/toss
+          New-Item -ItemType Directory srv | Out-Null
+          Compress-Archive -Path toss.exe -DestinationPath srv/toss_windows_amd64.zip
+          $h = (Get-FileHash srv/toss_windows_amd64.zip -Algorithm SHA256).Hash.ToLower()
+          "$h  toss_windows_amd64.zip" | Set-Content srv/SHA256SUMS
+          Start-Process python -ArgumentList '-m', 'http.server', '8765', '--bind', '127.0.0.1', '--directory', 'srv'
+          Start-Sleep 3
+          $env:TOSS_BASE_URL = 'http://127.0.0.1:8765'
+          foreach ($shell in 'powershell', 'pwsh') {
+            $env:TOSS_INSTALL_DIR = "$env:RUNNER_TEMP\toss-$shell"
+            & $shell -NoProfile -ExecutionPolicy Bypass -File install.ps1
+            if ($LASTEXITCODE -ne 0) { throw "install.ps1 failed under $shell" }
+            & "$env:TOSS_INSTALL_DIR\toss.exe" version
+            if ($LASTEXITCODE -ne 0) { throw "installed toss.exe does not run" }
+          }
+          # The PATH entry was added to the user environment.
+          $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
+          if ($userPath -notlike "*toss-pwsh*") { throw "PATH not updated: $userPath" }
