@@ -4,7 +4,7 @@ Peer-to-peer, end-to-end encrypted file transfer with **no relays and no servers
 anyone has to run**, and as few dependencies as possible.
 
 Status: milestone 1 (same network + direct address, with resume) implemented
-and tested. Nothing pushed yet.
+and tested.
 
 ## Goals
 
@@ -235,7 +235,7 @@ Skipped on purpose:
 4. Parallel streams over high-latency links, text/stdin sending.
 5. Optional `toss ui`: local web UI served by the toss binary on localhost.
 
-## Browser version (answered, not scheduled)
+## Browser version (not planned yet)
 
 A pure website can't satisfy "no servers":
 - browsers can't open raw TCP/UDP, join the DHT, or do LAN discovery;
@@ -269,6 +269,5 @@ Options:
 
 ## Decisions
 
-- License: MIT (confirmed).
-- QUIC via quic-go for milestone 3 (confirmed).
-- Push to github.com/yusufgurdogan/toss only when the user says so.
+- License: MIT.
+- QUIC via quic-go for milestone 3.
