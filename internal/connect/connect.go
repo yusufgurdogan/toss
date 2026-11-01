@@ -31,6 +31,10 @@ const (
 	dialTimeout          = 5 * time.Second
 )
 
+// bothHardGiveUp is how long the receiver keeps trying once it knows both
+// NATs are symmetric (the same-network search may still find the sender).
+var bothHardGiveUp = 10 * time.Second
+
 // clientHandshakeTimeout is shorter than the sender's handshakeTimeout:
 // the receiver has other addresses to try. A variable for tests.
 var clientHandshakeTimeout = 15 * time.Second
@@ -206,7 +210,10 @@ type NotFoundError struct {
 	// meeting point returned. Non-zero means the sender was found but no
 	// direct connection could be opened between the two networks.
 	FoundOnline int
-	LastErr     error // the last connection error, if any
+	// BothHard means both networks use symmetric NAT, which no direct
+	// connection can get through.
+	BothHard bool
+	LastErr  error // the last connection error, if any
 }
 
 func (e *NotFoundError) Error() string {
@@ -344,9 +351,34 @@ func Dial(ctx context.Context, c code.Code, opts DialOptions) (Conn, error) {
 		}
 	}
 
+	// Two symmetric NATs can't be connected; don't keep the user waiting
+	// once that's clear.
+	tick := time.NewTicker(time.Second)
+	defer tick.Stop()
+	var bothHardSince time.Time
+	notFound := func() error {
+		mu.Lock()
+		defer mu.Unlock()
+		nf := &NotFoundError{Addr: c.Addr, LastErr: lastDialErr}
+		if rv != nil {
+			nf.FoundOnline = rv.Found()
+			nf.BothHard = rv.BothHard()
+		}
+		return nf
+	}
+
 	var lastErr error
 	for {
 		select {
+		case <-tick.C:
+			if rv == nil || !rv.BothHard() {
+				continue
+			}
+			if bothHardSince.IsZero() {
+				bothHardSince = time.Now()
+			} else if time.Since(bothHardSince) > bothHardGiveUp {
+				return nil, notFound()
+			}
 		case cd := <-cands:
 			status("Found the sender at " + cd.remote().String())
 			// A peer that stalls must not hold up the search.
@@ -373,14 +405,9 @@ func Dial(ctx context.Context, c code.Code, opts DialOptions) (Conn, error) {
 			if parent.Err() != context.DeadlineExceeded {
 				return nil, parent.Err()
 			}
-			mu.Lock()
-			defer mu.Unlock()
-			if lastErr == nil {
-				lastErr = lastDialErr
-			}
-			nf := &NotFoundError{Addr: c.Addr, LastErr: lastErr}
-			if rv != nil {
-				nf.FoundOnline = rv.Found()
+			nf := notFound().(*NotFoundError)
+			if lastErr != nil {
+				nf.LastErr = lastErr
 			}
 			return nil, nf
 		}

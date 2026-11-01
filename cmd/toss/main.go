@@ -550,6 +550,11 @@ func explainDialError(err error) error {
 		case nf.Addr != "":
 			fmt.Fprintf(stderr, "%v.\n", nf)
 			fmt.Fprintln(stderr, "Check that toss send is still running and that no firewall blocks the port.")
+		case nf.BothHard:
+			fmt.Fprintln(stderr, "Found the sender, but both of your networks use \"symmetric\" NAT (common on")
+			fmt.Fprintln(stderr, "office, cloud and some mobile networks), and two of those can't be connected")
+			fmt.Fprintln(stderr, "directly. toss never sends files through anyone else's server. Put one of the")
+			fmt.Fprintln(stderr, "computers on a different network, such as home Wi-Fi or a phone hotspot.")
 		case nf.FoundOnline > 0:
 			fmt.Fprintln(stderr, "Found the sender, but couldn't open a direct connection between your two networks.")
 			fmt.Fprintln(stderr, "toss never sends files through anyone else's server, so it needs a direct path.")

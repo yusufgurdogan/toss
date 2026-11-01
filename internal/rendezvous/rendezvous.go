@@ -172,10 +172,17 @@ func watch(ctx context.Context, s *Socket, key dht.ID, opts *Options, found func
 }
 
 // announce publishes this socket under key, and again every reannounce.
+// Behind a symmetric NAT the public port the DHT nodes see is useless to
+// the peer, so we announce hardMarkPort instead, which tells the peer to
+// guess ports (see hard.go).
 func announce(ctx context.Context, s *Socket, key dht.ID, opts *Options) {
 	for {
 		res, err := s.DHT.GetPeers(ctx, key)
-		if err == nil && s.DHT.Announce(ctx, key, res.Closest, 0, true) > 0 {
+		port, implied := 0, true
+		if err == nil && selfHard(s) {
+			port, implied = hardMarkPort, false
+		}
+		if err == nil && s.DHT.Announce(ctx, key, res.Closest, port, implied) > 0 {
 			ext, _ := s.DHT.External()
 			opts.event(Event{Kind: "published", Addr: ext})
 			s.DHT.Save()
@@ -199,6 +206,7 @@ func announce(ctx context.Context, s *Socket, key dht.ID, opts *Options) {
 type Sender struct {
 	opts   Options
 	socks  []*Socket
+	hard   []*hardSet
 	conns  chan *quic.Conn
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
@@ -253,10 +261,29 @@ func StartSender(ctx context.Context, meetingID string, tlsConf *tls.Config, qco
 			}
 		})
 		s.wg.Go(func() { announce(ctx, sock, m.senderKey, &s.opts) })
+		var pp peerPorts
+		hard := &hardSet{}
+		s.hard = append(s.hard, hard)
 		s.wg.Go(func() {
 			watch(ctx, sock, m.receiverKey, &s.opts, func(p netip.AddrPort) {
 				s.opts.event(Event{Kind: "found", Addr: p})
-				startPunch(p)
+				peerHard := pp.add(p) || p.Port() == hardMarkPort
+				if p.Port() != hardMarkPort {
+					startPunch(p)
+				}
+				if peerHard {
+					// The receiver's NAT is symmetric: guess its ports.
+					s.opts.event(Event{Kind: "peer-hard-nat", Addr: p})
+					s.wg.Go(func() { spray(ctx, sock, p.Addr(), roleSender, m.tag, 0, nil) })
+				}
+				if selfHard(sock) && !peerHard {
+					// Ours is: send from many sockets, so many ports.
+					socks := hard.open(sock, &s.opts, func(hs *Socket) {
+						senderHardSocket(ctx, s, hs, m.tag, tlsConf, qconf)
+					})
+					s.opts.event(Event{Kind: "own-hard-nat", Addr: p})
+					s.wg.Go(func() { punchFrom(ctx, socks, p, roleSender, m.tag, 0, nil) })
+				}
 			})
 		})
 	}
@@ -280,17 +307,23 @@ func (s *Sender) Close() {
 	for _, sock := range s.socks {
 		sock.Close()
 	}
+	for _, h := range s.hard {
+		h.close()
+	}
 }
 
 // Receiver publishes the receiver in the DHT, looks for the sender there,
 // punches towards it and dials QUIC.
 type Receiver struct {
-	opts   Options
-	socks  []*Socket
-	conns  chan *quic.Conn
-	found  atomic.Int32
-	cancel context.CancelFunc
-	wg     sync.WaitGroup
+	opts     Options
+	socks    []*Socket
+	hard     []*hardSet
+	conns    chan *quic.Conn
+	found    atomic.Int32
+	selfHard atomic.Bool // our NAT is symmetric
+	peerHard atomic.Bool // the sender's NAT is symmetric
+	cancel   context.CancelFunc
+	wg       sync.WaitGroup
 }
 
 // StartReceiver starts looking for the sender of meetingID. tlsConf is the
@@ -366,14 +399,42 @@ func StartReceiver(ctx context.Context, meetingID string, tlsConf *tls.Config, q
 			case <-ctx.Done():
 			}
 		})
+		var pp peerPorts
+		hard := &hardSet{}
+		r.hard = append(r.hard, hard)
 		r.wg.Go(func() {
 			watch(ctx, sock, m.senderKey, &r.opts, func(p netip.AddrPort) {
 				r.found.Add(1)
 				r.opts.event(Event{Kind: "found", Addr: p})
+				// Symmetric NATs (see hard.go). All of this goes out at a
+				// short TTL, before we announce ourselves.
+				peerHard := pp.add(p) || p.Port() == hardMarkPort
+				if p.Port() == hardMarkPort {
+					r.peerHard.Store(true)
+				}
+				if selfHard(sock) {
+					r.selfHard.Store(true)
+				}
+				if peerHard {
+					r.opts.event(Event{Kind: "peer-hard-nat", Addr: p})
+					r.wg.Go(func() { spray(ctx, sock, p.Addr(), roleReceiver, m.tag, ladderStart, opened) })
+				}
+				if selfHard(sock) && !peerHard {
+					socks := hard.open(sock, &r.opts, func(hs *Socket) {
+						receiverHardSocket(ctx, r, hs, m.tag, tlsConf, qconf)
+					})
+					r.opts.event(Event{Kind: "own-hard-nat", Addr: p})
+					r.wg.Go(func() { punchFrom(ctx, socks, p, roleReceiver, m.tag, ladderStart, opened) })
+				}
 				mu.Lock()
 				dup := laddering[p]
 				laddering[p] = true
 				mu.Unlock()
+				if p.Port() == hardMarkPort {
+					// Nothing to punch at: the guessing above does the work.
+					foundOnce.Do(func() { close(found) })
+					return
+				}
 				if dup {
 					return
 				}
@@ -446,6 +507,10 @@ func (r *Receiver) Conns() <-chan *quic.Conn { return r.conns }
 // Found is how many sender addresses the DHT has returned so far.
 func (r *Receiver) Found() int { return int(r.found.Load()) }
 
+// BothHard reports whether both sides are behind symmetric NATs, which
+// hole punching can't get through.
+func (r *Receiver) BothHard() bool { return r.selfHard.Load() && r.peerHard.Load() }
+
 // Stop stops looking, punching and dialing. Connections already
 // delivered keep working until Close.
 func (r *Receiver) Stop() {
@@ -459,5 +524,8 @@ func (r *Receiver) Close() {
 	r.Stop()
 	for _, sock := range r.socks {
 		sock.Close()
+	}
+	for _, h := range r.hard {
+		h.close()
 	}
 }
