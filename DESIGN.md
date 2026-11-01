@@ -58,8 +58,10 @@ words). Custom codes (`--code`) must have the same shape, with 3–8 words.
    (nonce, source address) once. lanID = SHA-256("toss lan v1" || meetingID)[:16].
    The many targets are deliberate: multicast fails without a route,
    broadcast fails across some setups, IPv6 link-local usually just works.
-2. **Direct address** from the code suffix. The sender prints `code@addr` forms
-   for its public and private interface addresses. It listens on TCP 47924 by
+2. **Direct address** from the code suffix. The sender shows one code; if it has
+   a public address it adds a one-line hint to append `@address:port` for
+   receivers on other networks (with `--no-lan` the address is part of the
+   code). It listens on TCP 47924 by
    default (so a firewall rule or port forward can be set up once), falling
    back to a random port if that's taken; `--port` pins another.
 

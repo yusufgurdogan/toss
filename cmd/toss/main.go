@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/netip"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -43,8 +44,8 @@ Send options:
   --code CODE   use this code instead of a random one
   --port N      listen on TCP port N (default: 47924, or any free port if
                 that's taken)
-  --no-lan      don't answer local network searches; the receiver must use
-                one of the code@address forms
+  --no-lan      don't answer local network searches; the code then includes
+                this computer's address
 
 Receive options:
   --out DIR     save into DIR (default: the current folder)
@@ -236,28 +237,26 @@ func cmdSend(ctx context.Context, args []string) error {
 	}
 
 	fmt.Fprintf(stderr, "Sending %s.\n\n", describe(len(src.Offer.Files), src.Total))
+	// One code to read out. An address is only mentioned when it's
+	// needed: as a hint when this computer is reachable from other
+	// networks, or as part of the code with --no-lan.
 	public, private := lan.Addrs()
+	portStr := fmt.Sprint(tcpPort)
 	if *flags.noLAN {
-		fmt.Fprintln(stderr, "Not answering local network searches (--no-lan). On the other computer, run:")
+		addr := "ADDRESS"
+		if a, ok := bestAddr(public, private); ok {
+			addr = a.String()
+		}
+		fmt.Fprintf(stderr, "On the other computer, run:\n\n    toss %s\n\n", c.WithAddr(net.JoinHostPort(addr, portStr)))
+		if addr == "ADDRESS" {
+			fmt.Fprintln(stderr, "(ADDRESS is this computer's IP address.)")
+			fmt.Fprintln(stderr)
+		}
 	} else {
 		fmt.Fprintf(stderr, "On the other computer, run:\n\n    toss %s\n\n", c)
-	}
-	if addrs := append(public, private...); len(addrs) > 0 {
-		if !*flags.noLAN {
-			fmt.Fprintln(stderr, "If it can't find this computer, add an address to the code:")
+		if a, ok := bestAddr(public, nil); ok {
+			fmt.Fprintf(stderr, "From another network, add this computer's address to the end of the code: @%s\n\n", net.JoinHostPort(a.String(), portStr))
 		}
-		for i, a := range addrs {
-			if i == 4 {
-				break
-			}
-			fmt.Fprintf(stderr, "    toss %s\n", c.WithAddr(net.JoinHostPort(a.String(), fmt.Sprint(tcpPort))))
-		}
-		if len(public) > 0 {
-			fmt.Fprintf(stderr, "(Public addresses work from other networks too, unless a firewall blocks TCP port %d.)\n", tcpPort)
-		}
-		fmt.Fprintln(stderr)
-	} else if *flags.noLAN {
-		fmt.Fprintf(stderr, "    toss %s@ADDRESS:%d   (ADDRESS: this computer's IP address)\n\n", c, tcpPort)
 	}
 	fmt.Fprintln(stderr, "Waiting for the receiver... (Ctrl-C to cancel)")
 
@@ -276,6 +275,10 @@ func cmdSend(ctx context.Context, args []string) error {
 		if errors.Is(err, secure.ErrWrongCode) {
 			fmt.Fprintln(stderr, "\nSomeone tried to receive with a wrong code. For safety this code no longer works.")
 			fmt.Fprintln(stderr, "Run toss send again to get a new code.")
+			return errSilent
+		}
+		if errors.Is(err, context.Canceled) {
+			fmt.Fprintln(stderr, "\nCancelled.")
 			return errSilent
 		}
 		if errors.Is(err, secure.ErrLostAfterProof) {
@@ -307,6 +310,21 @@ func cmdSend(ctx context.Context, args []string) error {
 	}
 	fmt.Fprintf(stderr, "Sent %s%s.\n", describe(res.Files, res.Bytes+res.Resumed), resumeNote(res, time.Since(start)))
 	return nil
+}
+
+// bestAddr picks the address most likely to work for a receiver: public
+// before private, IPv4 (shorter, more widely routable) before IPv6.
+func bestAddr(public, private []netip.Addr) (netip.Addr, bool) {
+	for _, group := range [][]netip.Addr{public, private} {
+		for _, want4 := range []bool{true, false} {
+			for _, a := range group {
+				if a.Is4() == want4 {
+					return a, true
+				}
+			}
+		}
+	}
+	return netip.Addr{}, false
 }
 
 // defaultTCPPort is where the sender listens unless it's taken (another
@@ -452,7 +470,8 @@ func explainDialError(err error) error {
 		fmt.Fprintf(stderr, "%v.\n", nf)
 		if nf.Addr == "" {
 			fmt.Fprintln(stderr, "Check that toss send is running with this code and that both computers are on")
-			fmt.Fprintln(stderr, "the same network. Otherwise, use one of the code@address forms the sender printed.")
+			fmt.Fprintln(stderr, "the same network. From another network, add the sender's address to the code:")
+			fmt.Fprintln(stderr, "toss CODE@ADDRESS:PORT (toss send shows it when it has a public address).")
 		} else {
 			fmt.Fprintln(stderr, "Check that toss send is still running and that no firewall blocks the port.")
 		}

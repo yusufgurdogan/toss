@@ -76,7 +76,7 @@ Send options:
 - `--port N`: listen on TCP port N (default: 47924, or any free port if that's
   taken)
 - `--no-lan`: don't answer local network searches (e.g. on public Wi-Fi); the
-  receiver then uses one of the `code@address` forms
+  code then includes this computer's address
 
 Receive options:
 
@@ -91,9 +91,11 @@ On a shared computer, pass the code in the `TOSS_CODE` environment variable
 
 - **Same network** (home, office, two machines on one switch): the receiver
   finds the sender automatically.
-- **The sender is reachable** (public IP, a forwarded port, a VPN): the sender
-  prints codes like `toss 7392-river-moon-sun@203.0.113.5:41234`; use one of
-  those.
+- **The sender is reachable** (public IP, a forwarded port, a VPN): add the
+  sender's address to the end of the code, e.g.
+  `toss 7392-river-moon-sun@203.0.113.5:47924`. When the sender has a public
+  address, `toss send` shows it. For a VPN or a network that blocks the
+  automatic search, use the sender's VPN or LAN address the same way.
 
 Two computers on different networks, both behind NAT, can't connect yet. That
 is the next milestone: finding each other through the BitTorrent DHT and
@@ -109,8 +111,8 @@ someone else's server.
   `ufw enable`): the sender listens on TCP port 47924 when it's free, so
   allow that once with `sudo ufw allow 47924/tcp`. The automatic search also
   needs incoming UDP (port 47923 on the sender, and the replies on the
-  receiver). If a firewall gets in its way, use one of the `code@address`
-  forms the sender prints: that only needs the sender's TCP port.
+  receiver). If a firewall gets in its way, add the sender's address to the
+  code (`CODE@ADDRESS:47924`): that only needs the sender's TCP port.
 
 ## Resuming
 
