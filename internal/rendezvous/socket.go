@@ -121,6 +121,24 @@ func (s *Socket) WriteTTL(b []byte, to netip.AddrPort, ttl int) error {
 	return err
 }
 
+// WriteTTLMany sends the same packet to many addresses, each expiring
+// after ttl hops, changing the socket's TTL only once.
+func (s *Socket) WriteTTLMany(b []byte, to []netip.AddrPort, ttl int) error {
+	rc, err := s.udp.SyscallConn()
+	if err != nil {
+		return err
+	}
+	s.wmu.Lock()
+	defer s.wmu.Unlock()
+	if err := setTTL(rc, s.V6, ttl); err != nil {
+		return err
+	}
+	for _, a := range to {
+		s.udp.WriteToUDPAddrPort(b, a)
+	}
+	return setTTL(rc, s.V6, s.defTTL)
+}
+
 // sharedWriter is how the DHT client writes: shared with QUIC, excluded
 // from TTL changes.
 type sharedWriter struct{ s *Socket }

@@ -102,6 +102,56 @@ stdlib crypto/hkdf and cryptobyte for explicit uint16 length prefixes. The
 upstream transcript test vector still passes, so the logic is unchanged.
 Deps: github.com/gtank/ristretto255 v0.2.0, filippo.io/edwards25519 v1.2.0.
 
+## Across networks
+
+Package `internal/rendezvous`, using `internal/dht` and quic-go.
+
+- **Meeting.** The sender announces under SHA-1("toss/1 sender " + meetingID),
+  the receiver under SHA-1("toss/1 receiver " + meetingID), both with
+  `implied_port` so DHT nodes record the NAT's public mapping. Each side polls
+  for the other: a full lookup first and every minute, quick re-checks of the
+  closest nodes every 2 s.
+- **One socket per address family.** The same socket carries the DHT, the
+  probes and QUIC, so the mapping the DHT saw is the one QUIC uses. quic-go
+  takes KRPC for QUIC packets ("d" sets the QUIC bit), so a small dispatcher
+  reads every packet and routes it.
+- **Ordering, because of Linux-style routers.** A router that receives the
+  peer's packet before its host has sent to that peer creates a conntrack
+  entry; the host's own packets to the peer then get another public port,
+  and nothing gets through. So:
+  1. the receiver's first probes expire after 2 hops: they open its own NAT
+     but die before the sender's;
+  2. it announces itself only after that;
+  3. the sender, finding it, sends at full TTL;
+  4. the receiver goes to full TTL (and dials QUIC) once a sender probe
+     arrives;
+  5. otherwise the TTL climbs 3, 4, ... 16, then full, for carrier-grade NATs
+     further up.
+- **Symmetric NATs** (several public ports for one socket in DHT replies).
+  - The hard side announces port 1 as a marker.
+  - Hard sender, easy receiver: the receiver sends 2048 short-TTL guesses at
+    random ports on the sender's address *before* announcing itself. The
+    sender then sends from 256 sockets (about 99.97% chance that some pair
+    meets). It waits 5 s first if its marker went out only just before it
+    found the receiver.
+  - Easy sender, hard receiver: the receiver sends short-TTL probes from 256
+    sockets towards the sender before announcing. The sender then guesses
+    1024 ports a round at full TTL, for 4 rounds.
+  - Guessing is capped at 2 target addresses per side, so a fake announcement
+    can't turn toss into a packet cannon.
+  - Two hard NATs: no direct path exists. The receiver says so after 10 s.
+- **QUIC.** The receiver dials (TLS client, ALPN `toss/1`). The sender
+  listens on its socket(s). The code check runs on the first stream, bound to
+  the QUIC TLS exporter, under the same one-guess rule as TCP. A wrong code is
+  answered and then the connection is closed gracefully, so that the status
+  isn't lost.
+- **Tests.**
+  - Unit tests use fake DHT nodes on loopback.
+  - `scripts/lab` builds namespaces with two routers between two NATs (cone or
+    symmetric, plus IPv6 firewalls) and runs real binaries.
+  - Results: cone/cone, symmetric/cone and cone/symmetric connect in 1–5 s;
+    IPv6 connects when IPv4 is impossible; two symmetric NATs fail clearly.
+
 ## Transfer protocol (inside TLS)
 
 Frames: 1-byte type + uint32 big-endian length + payload. Control messages are
@@ -228,11 +278,8 @@ Skipped on purpose:
 ## Milestones
 
 1. **Same network + direct address, with resume.** Done.
-1b. **Different networks, one code.** BitTorrent DHT rendezvous (in-repo
-   client, IPv4 + IPv6), UDP hole punching with an ordered, TTL-limited
-   first punch (see internal/rendezvous), QUIC (quic-go) on the same socket,
-   the same TLS+PAKE binding. Works across cone NATs; symmetric NATs still
-   fail (port mapping and birthday-style port guessing are next).
+1b. **Different networks, one code.** Done. Details in "Across networks"
+   below.
 2. Router port opening: UPnP IGD, NAT-PMP, PCP (written in-repo).
 3. **Router-to-router**: BitTorrent mainline DHT (minimal in-repo KRPC client;
    announce under H(meetingID); DHT responses' `ip` field gives our public

@@ -3,6 +3,7 @@ package rendezvous
 import (
 	"context"
 	"io"
+	"net/netip"
 	"os"
 	"testing"
 	"time"
@@ -122,5 +123,26 @@ func TestProbesAreRecognized(t *testing.T) {
 	}
 	if m.senderKey == m.receiverKey {
 		t.Fatal("sender and receiver keys collide")
+	}
+}
+
+func TestSprayBudget(t *testing.T) {
+	var b sprayBudget
+	a1, a2, a3 := netip.MustParseAddr("192.0.2.1"), netip.MustParseAddr("192.0.2.2"), netip.MustParseAddr("192.0.2.3")
+	if !b.take(a1) || b.take(a1) || !b.take(a2) || b.take(a3) {
+		t.Fatal("spray budget doesn't limit targets")
+	}
+}
+
+func TestPeerPorts(t *testing.T) {
+	var pp peerPorts
+	if pp.add(netip.MustParseAddrPort("192.0.2.1:1000")) {
+		t.Fatal("one port is not a symmetric NAT")
+	}
+	if !pp.add(netip.MustParseAddrPort("192.0.2.1:2000")) {
+		t.Fatal("two ports on one address should look symmetric")
+	}
+	if pp.add(netip.MustParseAddrPort("192.0.2.1:3000")) {
+		t.Fatal("reported twice")
 	}
 }

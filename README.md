@@ -97,10 +97,14 @@ Anywhere the two computers can reach the internet, with the same one code:
   connection through their routers with UDP hole punching, then transfer
   over QUIC. This works behind typical home routers and on servers whose
   incoming ports are closed.
-- **Some networks can't be connected directly yet,** mainly ones with
-  "symmetric" NAT: some office firewalls, cloud NAT gateways and mobile
-  carriers. toss never relays your data through anyone else's server; when
-  no direct path exists it says so and suggests what helps.
+- **Stricter networks too:** when one side is behind a "symmetric" NAT
+  (some office firewalls, cloud NAT gateways, mobile carriers), toss finds a
+  way through by trying many ports at once. Over IPv6, which most mobile
+  networks offer, there's usually no NAT at all.
+- **Two symmetric NATs facing each other can't be connected directly.**
+  toss never relays your data through anyone else's server, so in that case
+  it says so (within seconds) and suggests what helps, such as putting one
+  computer on another network.
 - If you know the sender's address and port is open, you can also skip the
   search: `toss 7392-river-moon-sun@203.0.113.5:47924`.
 
@@ -161,24 +165,39 @@ anything, toss checks that the bytes on both sides match.
 
 ## How it works
 
-1. The receiver asks the local network (UDP port 47923: multicast
-   239.255.116.115, IPv6 ff02::746f:7373, and broadcast) whether a sender for
-   `7392-river` is around. The sender answers with its TCP port. With a
-   `code@address` the receiver connects directly instead.
-2. Over TCP the two sides run TLS 1.3, then CPace with the full code, using
-   the TLS exporter as associated data, then confirm they derived the same key.
+1. **Finding each other.** Every way is tried at once:
+   - the local network: UDP port 47923, multicast 239.255.116.115, IPv6
+     ff02::746f:7373 and broadcast;
+   - the BitTorrent DHT, under hashes of the code's public part (`7392-river`);
+   - a `code@address` if given.
+
+   Across networks, each side learns the other's public address from the
+   DHT. Both then send UDP probes to each other so their routers let the
+   other side in (hole punching); the first probes are ordered and
+   short-lived so routers don't block each other. Behind symmetric NATs, many
+   ports are tried at once.
+2. **Checking the code.** Over TCP (local network) or QUIC (internet) the two
+   sides run TLS 1.3, then CPace with the full code, using the TLS exporter as
+   associated data, then confirm they derived the same key.
 3. The sender offers its file list. The receiver checks it against the
    destination folder and asks you. For resuming, it asks the sender for
    hashes of what it already has.
 4. The files stream through a pipeline that reads, hashes, encrypts and
-   writes in parallel, at about 1.2 GB/s on a fast machine.
+   writes in parallel: about 1.2 GB/s over a local network, and about
+   1 Gbit/s over QUIC.
+
+Set `TOSS_DEBUG=1` to see what the search is doing. `scripts/lab/` holds a
+NAT simulation (Linux network namespaces, needs root) that runs real toss
+binaries through cone and symmetric NATs and IPv6 firewalls.
 
 Details are in [DESIGN.md](DESIGN.md).
 
 ## Dependencies
 
 The Go standard library, plus `github.com/gtank/ristretto255` and
-`filippo.io/edwards25519` for the PAKE group. The CPace implementation is
+`filippo.io/edwards25519` for the PAKE group, and `github.com/quic-go/quic-go`
+(which brings the Go team's `golang.org/x/crypto`, `x/net` and `x/sys`) for
+QUIC. The DHT client and everything else is in this repository. The CPace implementation is
 vendored from `filippo.io/cpace` (BSD, Google LLC) in `internal/cpace`.
 
 ## License

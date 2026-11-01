@@ -26,8 +26,26 @@ import (
 const (
 	hardSockets  = 256
 	sprayGuesses = 1024
-	sprayRounds  = 6
+	sprayRounds  = 4
 	sprayEvery   = 10 * time.Second
+	// firstGuesses is the receiver's one round of guesses at a symmetric
+	// sender, all sent before the receiver announces itself: once the
+	// sender's sockets start sending, our router remembers their ports as
+	// unsolicited and later guesses at them clash. 2048 guesses against
+	// 256 sockets meet with a probability of about 99.97%.
+	firstGuesses = 2048
+	// hardStartDelay gives the receiver time to see a symmetric sender's
+	// marker (and guess) before the sender's sockets start sending, when
+	// the sender only found out late that its NAT is symmetric.
+	hardStartDelay = 5 * time.Second
+	// hardSafeGap: a receiver found more than this after our marker went
+	// out looked us up after the marker (lookup plus poll take less).
+	hardSafeGap = 6 * time.Second
+	// maxSprayTargets bounds how many addresses one side guesses ports on.
+	// Anyone who can see the meeting in the DHT could announce a fake
+	// "symmetric" peer at someone else's address; this keeps the packets
+	// we can be made to send small (a few thousand tiny probes).
+	maxSprayTargets = 2
 	// selfHardPorts is how many different public ports DHT nodes must
 	// report for one socket before we decide our NAT is symmetric.
 	selfHardPorts = 3
@@ -49,6 +67,26 @@ type peerPorts struct {
 	mu    sync.Mutex
 	ports map[netip.Addr]map[uint16]bool
 	hard  map[netip.Addr]bool
+}
+
+// sprayBudget limits port guessing per side and meeting.
+type sprayBudget struct {
+	mu      sync.Mutex
+	targets map[netip.Addr]bool
+}
+
+// take reports whether guessing at ip is allowed.
+func (b *sprayBudget) take(ip netip.Addr) bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.targets == nil {
+		b.targets = map[netip.Addr]bool{}
+	}
+	if b.targets[ip] || len(b.targets) >= maxSprayTargets {
+		return false
+	}
+	b.targets[ip] = true
+	return true
 }
 
 // add records an address and reports whether this made its IP look hard
@@ -102,6 +140,20 @@ func spray(ctx context.Context, s *Socket, ip netip.Addr, role byte, tag [16]byt
 			return
 		case <-done:
 			return
+		}
+	}
+}
+
+// guessOnce sends one round of short-TTL guesses at random ports on ip,
+// all at once.
+func guessOnce(s *Socket, ip netip.Addr, role byte, tag [16]byte, ttl, n int) {
+	to := make([]netip.AddrPort, n)
+	for i := range to {
+		to[i] = netip.AddrPortFrom(ip, uint16(1024+rand.IntN(65536-1024)))
+	}
+	if s.WriteTTLMany(makeProbe(role, tag), to, ttl) != nil {
+		for _, a := range to { // no TTL control here: send them plainly
+			s.WriteTo(makeProbe(role, tag), a)
 		}
 	}
 }

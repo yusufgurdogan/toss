@@ -174,15 +174,23 @@ func watch(ctx context.Context, s *Socket, key dht.ID, opts *Options, found func
 // announce publishes this socket under key, and again every reannounce.
 // Behind a symmetric NAT the public port the DHT nodes see is useless to
 // the peer, so we announce hardMarkPort instead, which tells the peer to
-// guess ports (see hard.go).
-func announce(ctx context.Context, s *Socket, key dht.ID, opts *Options) {
+// guess ports (see hard.go). If we find out later that our NAT is
+// symmetric we announce again at once; markedAt records when the marker
+// first went out.
+func announce(ctx context.Context, s *Socket, key dht.ID, opts *Options, markedAt *atomic.Int64) {
+	announcedHard := false
 	for {
 		res, err := s.DHT.GetPeers(ctx, key)
+		hard := err == nil && selfHard(s)
 		port, implied := 0, true
-		if err == nil && selfHard(s) {
+		if hard {
 			port, implied = hardMarkPort, false
 		}
 		if err == nil && s.DHT.Announce(ctx, key, res.Closest, port, implied) > 0 {
+			announcedHard = hard
+			if hard && markedAt != nil {
+				markedAt.CompareAndSwap(0, time.Now().UnixNano())
+			}
 			ext, _ := s.DHT.External()
 			opts.event(Event{Kind: "published", Addr: ext})
 			s.DHT.Save()
@@ -193,10 +201,15 @@ func announce(ctx context.Context, s *Socket, key dht.ID, opts *Options) {
 		if err != nil {
 			wait = 10 * time.Second
 		}
-		select {
-		case <-time.After(wait):
-		case <-ctx.Done():
-			return
+		for end := time.Now().Add(wait); time.Now().Before(end); {
+			select {
+			case <-time.After(2 * time.Second):
+			case <-ctx.Done():
+				return
+			}
+			if err == nil && selfHard(s) != announcedHard {
+				break // our NAT turned out to be symmetric: say so now
+			}
 		}
 	}
 }
@@ -260,10 +273,50 @@ func StartSender(ctx context.Context, meetingID string, tlsConf *tls.Config, qco
 				}
 			}
 		})
-		s.wg.Go(func() { announce(ctx, sock, m.senderKey, &s.opts) })
+		var markedAt atomic.Int64
+		s.wg.Go(func() { announce(ctx, sock, m.senderKey, &s.opts, &markedAt) })
 		var pp peerPorts
+		var budget sprayBudget
 		hard := &hardSet{}
 		s.hard = append(s.hard, hard)
+		var known []netip.AddrPort // receivers with a usable port
+		hardPunched := map[netip.AddrPort]bool{}
+		// hardPunch sends from many sockets (so many public ports) to a
+		// receiver, once our NAT is known to be symmetric and the
+		// receiver has had time to see our marker and guess.
+		hardPunch := func(p netip.AddrPort) {
+			mu.Lock()
+			if hardPunched[p] {
+				mu.Unlock()
+				return
+			}
+			hardPunched[p] = true
+			mu.Unlock()
+			foundAt := time.Now()
+			s.wg.Go(func() {
+				for {
+					// The receiver guesses our ports before announcing
+					// itself, if it saw our marker by then. That's certain
+					// when the marker went out well before we found it;
+					// otherwise give it time to see the marker and guess.
+					at := markedAt.Load()
+					marked := time.Unix(0, at)
+					if at != 0 && (foundAt.Sub(marked) > hardSafeGap || time.Since(marked) >= hardStartDelay) {
+						break
+					}
+					select {
+					case <-time.After(250 * time.Millisecond):
+					case <-ctx.Done():
+						return
+					}
+				}
+				socks := hard.open(sock, &s.opts, func(hs *Socket) {
+					senderHardSocket(ctx, s, hs, m.tag, tlsConf, qconf)
+				})
+				s.opts.event(Event{Kind: "own-hard-nat", Addr: p})
+				punchFrom(ctx, socks, p, roleSender, m.tag, 0, nil)
+			})
+		}
 		s.wg.Go(func() {
 			watch(ctx, sock, m.receiverKey, &s.opts, func(p netip.AddrPort) {
 				s.opts.event(Event{Kind: "found", Addr: p})
@@ -271,20 +324,39 @@ func StartSender(ctx context.Context, meetingID string, tlsConf *tls.Config, qco
 				if p.Port() != hardMarkPort {
 					startPunch(p)
 				}
-				if peerHard {
+				if peerHard && budget.take(p.Addr()) {
 					// The receiver's NAT is symmetric: guess its ports.
 					s.opts.event(Event{Kind: "peer-hard-nat", Addr: p})
 					s.wg.Go(func() { spray(ctx, sock, p.Addr(), roleSender, m.tag, 0, nil) })
 				}
-				if selfHard(sock) && !peerHard {
-					// Ours is: send from many sockets, so many ports.
-					socks := hard.open(sock, &s.opts, func(hs *Socket) {
-						senderHardSocket(ctx, s, hs, m.tag, tlsConf, qconf)
-					})
-					s.opts.event(Event{Kind: "own-hard-nat", Addr: p})
-					s.wg.Go(func() { punchFrom(ctx, socks, p, roleSender, m.tag, 0, nil) })
+				if !peerHard {
+					mu.Lock()
+					known = append(known, p)
+					mu.Unlock()
+					if selfHard(sock) {
+						hardPunch(p)
+					}
 				}
 			})
+		})
+		// We may learn only later that our NAT is symmetric.
+		s.wg.Go(func() {
+			for {
+				select {
+				case <-time.After(2 * time.Second):
+				case <-ctx.Done():
+					return
+				}
+				if !selfHard(sock) {
+					continue
+				}
+				mu.Lock()
+				list := append([]netip.AddrPort(nil), known...)
+				mu.Unlock()
+				for _, p := range list {
+					hardPunch(p)
+				}
+			}
 		})
 	}
 	return s, nil
@@ -395,13 +467,54 @@ func StartReceiver(ctx context.Context, meetingID string, tlsConf *tls.Config, q
 		r.wg.Go(func() {
 			select {
 			case <-found:
-				announce(ctx, sock, m.receiverKey, &r.opts)
+				announce(ctx, sock, m.receiverKey, &r.opts, nil)
 			case <-ctx.Done():
 			}
 		})
 		var pp peerPorts
+		var budget sprayBudget
 		hard := &hardSet{}
 		r.hard = append(r.hard, hard)
+		var known []netip.AddrPort // senders with a usable port
+		hardPunched := map[netip.AddrPort]bool{}
+		// hardPunch sends short-TTL probes from many sockets to a sender,
+		// once our NAT is known to be symmetric. Our announcement (with
+		// the marker) follows, and the sender then guesses at us.
+		hardPunch := func(p netip.AddrPort) {
+			mu.Lock()
+			if hardPunched[p] {
+				mu.Unlock()
+				return
+			}
+			hardPunched[p] = true
+			mu.Unlock()
+			socks := hard.open(sock, &r.opts, func(hs *Socket) {
+				receiverHardSocket(ctx, r, hs, m.tag, tlsConf, qconf)
+			})
+			r.opts.event(Event{Kind: "own-hard-nat", Addr: p})
+			for _, hs := range socks { // the first probes go out now
+				hs.WriteTTL(makeProbe(roleReceiver, m.tag), p, ladderStart)
+			}
+			r.wg.Go(func() { punchFrom(ctx, socks, p, roleReceiver, m.tag, ladderStart, opened) })
+		}
+		r.wg.Go(func() {
+			for {
+				select {
+				case <-time.After(2 * time.Second):
+				case <-ctx.Done():
+					return
+				}
+				if !selfHard(sock) {
+					continue
+				}
+				mu.Lock()
+				list := append([]netip.AddrPort(nil), known...)
+				mu.Unlock()
+				for _, p := range list {
+					hardPunch(p)
+				}
+			}
+		})
 		r.wg.Go(func() {
 			watch(ctx, sock, m.senderKey, &r.opts, func(p netip.AddrPort) {
 				r.found.Add(1)
@@ -409,22 +522,25 @@ func StartReceiver(ctx context.Context, meetingID string, tlsConf *tls.Config, q
 				// Symmetric NATs (see hard.go). All of this goes out at a
 				// short TTL, before we announce ourselves.
 				peerHard := pp.add(p) || p.Port() == hardMarkPort
-				if p.Port() == hardMarkPort {
+				if peerHard {
 					r.peerHard.Store(true)
 				}
 				if selfHard(sock) {
 					r.selfHard.Store(true)
 				}
-				if peerHard {
+				if peerHard && budget.take(p.Addr()) {
+					// One big round of guesses, done before we announce
+					// ourselves (the sender starts sending when it finds us).
 					r.opts.event(Event{Kind: "peer-hard-nat", Addr: p})
-					r.wg.Go(func() { spray(ctx, sock, p.Addr(), roleReceiver, m.tag, ladderStart, opened) })
+					guessOnce(sock, p.Addr(), roleReceiver, m.tag, ladderStart, firstGuesses)
 				}
-				if selfHard(sock) && !peerHard {
-					socks := hard.open(sock, &r.opts, func(hs *Socket) {
-						receiverHardSocket(ctx, r, hs, m.tag, tlsConf, qconf)
-					})
-					r.opts.event(Event{Kind: "own-hard-nat", Addr: p})
-					r.wg.Go(func() { punchFrom(ctx, socks, p, roleReceiver, m.tag, ladderStart, opened) })
+				if !peerHard {
+					mu.Lock()
+					known = append(known, p)
+					mu.Unlock()
+					if selfHard(sock) {
+						hardPunch(p)
+					}
 				}
 				mu.Lock()
 				dup := laddering[p]
